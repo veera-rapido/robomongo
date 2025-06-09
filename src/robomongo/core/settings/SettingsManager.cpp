@@ -179,6 +179,114 @@ namespace Robomongo
         return ok;
     }
 
+    bool SettingsManager::loadConnectionsFromFile(const QString& configFilePath)
+    {
+        if (!QFile::exists(configFilePath)) {
+            LOG_MSG("ERROR: Config file does not exist: " + configFilePath, mongo::logger::LogSeverity::Error());
+            return false;
+        }
+
+        QFile configFile(configFilePath);
+        if (!configFile.open(QIODevice::ReadOnly)) {
+            LOG_MSG("ERROR: Could not open config file: " + configFilePath, mongo::logger::LogSeverity::Error());
+            return false;
+        }
+
+        bool ok;
+        QJson::Parser parser;
+        QVariantMap configMap = parser.parse(configFile.readAll(), &ok).toMap();
+        if (!ok) {
+            LOG_MSG("ERROR: Failed to parse config file: " + configFilePath, mongo::logger::LogSeverity::Error());
+            return false;
+        }
+
+        // Check if this is a full config file or connections-only file
+        QVariantList connectionsList;
+        if (configMap.contains("connections")) {
+            // Full config file format
+            connectionsList = configMap.value("connections").toList();
+        } else if (configMap.contains("connectionsList")) {
+            // Alternative format with connectionsList key
+            connectionsList = configMap.value("connectionsList").toList();
+        } else {
+            // Assume the entire file is a list of connections
+            connectionsList = configMap.values();
+            if (connectionsList.isEmpty()) {
+                // Try to treat the whole map as a single connection
+                connectionsList.append(configMap);
+            }
+        }
+
+        if (connectionsList.isEmpty()) {
+            LOG_MSG("WARNING: No connections found in config file: " + configFilePath, mongo::logger::LogSeverity::Warning());
+            return true; // Not an error, just no connections to load
+        }
+
+        // Load connections from the external file
+        int loadedCount = 0;
+        for (const QVariant& connVariant : connectionsList) {
+            QVariantMap connMap = connVariant.toMap();
+            if (connMap.isEmpty()) {
+                continue;
+            }
+
+            try {
+                auto connSettings = new ConnectionSettings(false);
+                connSettings->fromVariant(connMap);
+                connSettings->setImported(true); // Mark as imported from external file
+
+                // Add a prefix to connection name to indicate it's from external file
+                QString originalName = QString::fromStdString(connSettings->connectionName());
+                if (!originalName.startsWith("[External] ")) {
+                    connSettings->setConnectionName("[External] " + originalName.toStdString());
+                }
+
+                // Check for duplicate connections to avoid importing the same connection multiple times
+                bool isDuplicate = false;
+                for (const auto& existingConn : _connections) {
+                    if (connSettings->serverHost() == existingConn->serverHost() &&
+                        connSettings->serverPort() == existingConn->serverPort() &&
+                        connSettings->defaultDatabase() == existingConn->defaultDatabase()) {
+
+                        // Check credentials if they exist
+                        CredentialSettings* newCred = connSettings->primaryCredential();
+                        CredentialSettings* existingCred = existingConn->primaryCredential();
+
+                        if (newCred && existingCred &&
+                            newCred->databaseName() == existingCred->databaseName() &&
+                            newCred->userName() == existingCred->userName()) {
+                            isDuplicate = true;
+                            break;
+                        } else if (!newCred && !existingCred) {
+                            isDuplicate = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!isDuplicate) {
+                    addConnection(connSettings);
+                    loadedCount++;
+                } else {
+                    delete connSettings; // Clean up duplicate connection
+                    LOG_MSG("INFO: Skipped duplicate connection: " + originalName.toStdString(),
+                           mongo::logger::LogSeverity::Info());
+                }
+            } catch (const std::exception& ex) {
+                LOG_MSG("ERROR: Failed to load connection from config file. Reason: " + std::string(ex.what()),
+                       mongo::logger::LogSeverity::Error());
+            }
+        }
+
+        LOG_MSG("Successfully loaded " + std::to_string(loadedCount) + " connections from: " + configFilePath,
+               mongo::logger::LogSeverity::Info());
+
+        // Save the updated settings to persist the loaded connections
+        save();
+
+        return loadedCount > 0;
+    }
+
     void SettingsManager::addCacheData(QString const& key, QVariant const& value)
     {
         _cacheData.insert(key, value);

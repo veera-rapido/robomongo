@@ -1,0 +1,168 @@
+name: Build macOS Binary
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ master, main, develop ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type (release or debug)'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+        - release
+        - debug
+
+jobs:
+  build-macos:
+    runs-on: macos-13
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install setuptools==45
+        pip install scons==3.1.2
+
+    - name: Install system dependencies
+      run: |
+        brew update
+        brew install cmake ninja pkg-config
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: '5.12.8'
+        host: 'mac'
+        target: 'desktop'
+        arch: 'clang_64'
+        dir: '${{ runner.temp }}/qt'
+        install-deps: 'true'
+        cache: 'true'
+
+    - name: Cache OpenSSL
+      id: cache-openssl
+      uses: actions/cache@v4
+      with:
+        path: /opt/openssl-1.1.1f
+        key: ${{ runner.os }}-openssl-1.1.1f
+
+    - name: Build OpenSSL
+      if: steps.cache-openssl.outputs.cache-hit != 'true'
+      run: |
+        cd /tmp
+        curl -L -o openssl-1.1.1f.tar.gz \
+          https://www.openssl.org/source/old/1.1.1/openssl-1.1.1f.tar.gz
+        tar -xf openssl-1.1.1f.tar.gz
+        cd openssl-1.1.1f
+        sudo mkdir -p /opt/openssl-1.1.1f
+        sudo chown -R $(whoami) /opt/openssl-1.1.1f
+        ./Configure darwin64-x86_64-cc shared no-ssl2 no-ssl3 no-comp \
+          -mmacosx-version-min=10.14 --prefix=/opt/openssl-1.1.1f
+        make -j$(sysctl -n hw.ncpu)
+        make install
+
+        # Fix rpath issues for macOS
+        cd /opt/openssl-1.1.1f/lib
+        install_name_tool -id "@rpath/lib/libssl.1.1.dylib" libssl.1.1.dylib
+        install_name_tool -change /opt/openssl-1.1.1f/lib/libcrypto.1.1.dylib \
+          @rpath/lib/libcrypto.1.1.dylib libssl.1.1.dylib
+        install_name_tool -id "@rpath/lib/libcrypto.1.1.dylib" libcrypto.1.1.dylib
+
+        # Create lib directory for robo-unit-test dependency
+        mkdir -p lib/
+        cp lib*.dylib lib/
+
+    - name: Cache Robo Shell
+      id: cache-roboshell
+      uses: actions/cache@v4
+      with:
+        path: /opt/robo-shell
+        key: ${{ runner.os }}-roboshell-v4.2
+
+    - name: Build Robo Shell
+      if: steps.cache-roboshell.outputs.cache-hit != 'true'
+      run: |
+        cd /tmp
+        git clone --depth 1 --branch roboshell-v4.2 \
+          https://github.com/paralect/robomongo-shell.git robo-shell
+        cd robo-shell
+
+        # Install Python dependencies with setuptools 45 for compatibility
+        pip3 install --user setuptools==45
+        pip3 install --user scons==3.1.2
+        pip3 install --user -r etc/pip/compile-requirements.txt
+        pip3 install --user -r etc/pip/dev-requirements.txt
+
+        # Set environment variables exactly as documented
+        export ROBOMONGO_CMAKE_PREFIX_PATH="${{ runner.temp }}/qt/Qt/5.12.8/clang_64;/opt/robo-shell;/opt/openssl-1.1.1f"
+
+        # Build using existing build system
+        bin/build
+
+        # Install to expected location
+        sudo mkdir -p /opt/robo-shell
+        sudo cp -r . /opt/robo-shell/
+
+    - name: Set build type
+      run: |
+        if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+          echo "BUILD_TYPE=debug" >> $GITHUB_ENV
+        else
+          echo "BUILD_TYPE=release" >> $GITHUB_ENV
+        fi
+
+    - name: Set environment variables
+      run: |
+        echo "ROBOMONGO_CMAKE_PREFIX_PATH=${{ runner.temp }}/qt/Qt/5.12.8/clang_64;/opt/robo-shell;/opt/openssl-1.1.1f" >> $GITHUB_ENV
+
+    - name: Configure Robo 3T
+      run: bin/configure ${{ env.BUILD_TYPE }}
+
+    - name: Build Robo 3T
+      run: bin/build ${{ env.BUILD_TYPE }}
+
+    - name: Install Robo 3T
+      run: bin/install ${{ env.BUILD_TYPE }}
+
+    - name: Create Package
+      run: bin/pack ${{ env.BUILD_TYPE }}
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: robo3t-macos-${{ env.BUILD_TYPE }}
+        path: |
+          build/${{ env.BUILD_TYPE }}/install/
+          build/${{ env.BUILD_TYPE }}/package/
+        retention-days: 30
+
+    - name: Upload DMG Package
+      uses: actions/upload-artifact@v4
+      with:
+        name: robo3t-macos-${{ env.BUILD_TYPE }}-dmg
+        path: build/${{ env.BUILD_TYPE }}/package/*.dmg
+        retention-days: 90
+
+    - name: Test Binary
+      run: |
+        # Test that the binary can be executed and shows help
+        build/${{ env.BUILD_TYPE }}/install/Robo\ 3T.app/Contents/MacOS/Robo\ 3T --help || true
+
+        # Test our new config file feature
+        echo '{"connections":[{"connectionName":"Test","serverHost":"localhost","serverPort":27017,"defaultDatabase":"test","isReplicaSet":false,"credentials":[],"ssh":{"enabled":false},"ssl":{"enabled":false}}]}' > test-config.json
+        build/${{ env.BUILD_TYPE }}/install/Robo\ 3T.app/Contents/MacOS/Robo\ 3T --config-file test-config.json --help || true

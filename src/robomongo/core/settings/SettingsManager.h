@@ -67,6 +67,13 @@ namespace Robomongo
         bool save();
 
         /**
+         * @brief Load database connections from an external config file.
+         * @param configFilePath Path to the external configuration file
+         * @return true if success, false otherwise
+         */
+        bool loadConnectionsFromFile(const QString& configFilePath);
+
+        /**
          * @brief Adds connection to the end of list.
          * Connection now will be owned by SettingsManager.
          */

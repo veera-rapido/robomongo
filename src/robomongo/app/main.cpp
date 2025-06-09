@@ -1,5 +1,7 @@
 #include <QApplication>
 #include <QDesktopWidget>
+#include <QCommandLineParser>
+#include <QCommandLineOption>
 
 #include <locale.h>
 
@@ -61,6 +63,21 @@ int main(int argc, char *argv[], char** envp)
     // Initialize Qt application
     QApplication app(argc, argv);
 
+    // Set up command line parser
+    QCommandLineParser parser;
+    parser.setApplicationDescription("Robo 3T - MongoDB GUI");
+    parser.addHelpOption();
+    parser.addVersionOption();
+
+    // Add config file option
+    QCommandLineOption configFileOption(QStringList() << "c" << "config-file",
+        "Load database connections from the specified configuration file.",
+        "file");
+    parser.addOption(configFileOption);
+
+    // Process command line arguments
+    parser.process(app);
+
     // On Unix/Linux Qt is configured to use the system locale settings by default.
     // This can cause a conflict when using POSIX functions, for instance, when
     // converting between data types such as floats and strings, since the notation
@@ -74,8 +91,16 @@ int main(int argc, char *argv[], char** envp)
     app.setAttribute(Qt::AA_UseHighDpiPixmaps);
 #endif
      
-    // EULA License Agreement
+    // Load external config file if specified
     auto const& settings { Robomongo::AppRegistry::instance().settingsManager() };
+    if (parser.isSet(configFileOption)) {
+        QString configFilePath = parser.value(configFileOption);
+        if (!settings->loadConnectionsFromFile(configFilePath)) {
+            qWarning() << "Failed to load connections from config file:" << configFilePath;
+        }
+    }
+
+    // EULA License Agreement
     if (!settings->acceptedEulaVersions().contains(PROJECT_VERSION)) {
         bool const showFormPage { settings->programExitedNormally() && !settings->disableHttpsFeatures() };
         Robomongo::EulaDialog eulaDialog(showFormPage);
